@@ -157,72 +157,134 @@ class GRNN(nn.Module):
     """Grouped RNN"""
     def __init__(self, input_size, hidden_size, num_layers=1, batch_first=True, bidirectional=False):
         super().__init__()
+        # 隐藏层大小
         self.hidden_size = hidden_size
+        # RNN 层数
         self.num_layers = num_layers
+        # 是否使用双向 RNN
         self.bidirectional = bidirectional
-        self.rnn1 = nn.GRU(input_size//2, hidden_size//2, num_layers, batch_first=batch_first, bidirectional=bidirectional)
-        self.rnn2 = nn.GRU(input_size//2, hidden_size//2, num_layers, batch_first=batch_first, bidirectional=bidirectional)
+
+        # 第一个 GRU，处理输入特征的一半通道
+        self.rnn1 = nn.GRU(input_size//2, hidden_size//2, num_layers,
+                           batch_first=batch_first, bidirectional=bidirectional)
+        # 第二个 GRU，处理输入特征的另一半通道
+        self.rnn2 = nn.GRU(input_size//2, hidden_size//2, num_layers,
+                           batch_first=batch_first, bidirectional=bidirectional)
 
     def forward(self, x, h=None):
         """
-        x: (B, seq_length, input_size)
-        h: (num_layers, B, hidden_size)
+        前向传播函数
+
+        参数:
+            x (Tensor): 输入张量，形状为 (B, seq_length, input_size)，其中 B 是批量大小，
+                        seq_length 是序列长度，input_size 是输入特征维度。
+            h (Tensor): 初始隐藏状态，形状为 (num_layers, B, hidden_size)
+
+        返回:
+            y (Tensor): 输出张量，形状为 (B, seq_length, hidden_size)
+            h (Tensor): 最终隐藏状态，形状为 (num_layers, B, hidden_size)
         """
-        if h== None:
+        # 如果没有提供初始隐藏状态，则初始化为零
+        if h == None:
             if self.bidirectional:
                 h = torch.zeros(self.num_layers*2, x.shape[0], self.hidden_size, device=x.device)
             else:
                 h = torch.zeros(self.num_layers, x.shape[0], self.hidden_size, device=x.device)
+
+        # 将输入特征分为两部分
         x1, x2 = torch.chunk(x, chunks=2, dim=-1)
+        # 将隐藏状态分为两部分
         h1, h2 = torch.chunk(h, chunks=2, dim=-1)
+        # 确保张量在内存中是连续的
         h1, h2 = h1.contiguous(), h2.contiguous()
+
+        # 分别通过两个 GRU 进行处理
         y1, h1 = self.rnn1(x1, h1)
         y2, h2 = self.rnn2(x2, h2)
+
+        # 将输出和隐藏状态拼接在一起
         y = torch.cat([y1, y2], dim=-1)
         h = torch.cat([h1, h2], dim=-1)
+
         return y, h
+
     
     
 class DPGRNN(nn.Module):
     """Grouped Dual-path RNN"""
     def __init__(self, input_size, width, hidden_size, **kwargs):
         super(DPGRNN, self).__init__(**kwargs)
+        # 输入特征维度
         self.input_size = input_size
+        # 宽度（频率子带数量）
         self.width = width
+        # 隐藏层大小
         self.hidden_size = hidden_size
 
+        # Intra RNN 模块，用于处理每个时间帧内的频率依赖关系
         self.intra_rnn = GRNN(input_size=input_size, hidden_size=hidden_size//2, bidirectional=True)
+        # 全连接层，用于处理 Intra RNN 的输出
         self.intra_fc = nn.Linear(hidden_size, hidden_size)
+        # 层归一化，应用于 Intra RNN 的输出
         self.intra_ln = nn.LayerNorm((width, hidden_size), eps=1e-8)
 
+        # Inter RNN 模块，用于处理时间帧之间的依赖关系
         self.inter_rnn = GRNN(input_size=input_size, hidden_size=hidden_size, bidirectional=False)
+        # 全连接层，用于处理 Inter RNN 的输出
         self.inter_fc = nn.Linear(hidden_size, hidden_size)
-        self.inter_ln = nn.LayerNorm(((width, hidden_size)), eps=1e-8)
-    
+        # 层归一化，应用于 Inter RNN 的输出
+        self.inter_ln = nn.LayerNorm((width, hidden_size), eps=1e-8)
+
     def forward(self, x):
-        """x: (B, C, T, F)"""
+        """
+        前向传播函数
+
+        参数:
+            x (Tensor): 输入张量，形状为 (B, C, T, F)，其中 B 是批量大小，
+                        C 是通道数，T 是时间帧数，F 是频率点数。
+
+        返回:
+            Tensor: 经过 Dual-path RNN 处理后的输出张量，形状为 (B, C, T, F)
+        """
         ## Intra RNN
+        # 调整输入张量的维度以便进行时间帧内处理
         x = x.permute(0, 2, 3, 1)  # (B,T,F,C)
+        # 将时间帧和批量合并，以便进行独立处理
         intra_x = x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3])  # (B*T,F,C)
+        # 应用 Intra RNN 进行时间帧内处理
         intra_x = self.intra_rnn(intra_x)[0]  # (B*T,F,C)
+        # 应用全连接层
         intra_x = self.intra_fc(intra_x)      # (B*T,F,C)
+        # 恢复时间帧和批量维度
         intra_x = intra_x.reshape(x.shape[0], -1, self.width, self.hidden_size) # (B,T,F,C)
+        # 应用层归一化
         intra_x = self.intra_ln(intra_x)
+        # 将原始输入与 Intra RNN 输出相加（残差连接）
         intra_out = torch.add(x, intra_x)
 
         ## Inter RNN
-        x = intra_out.permute(0,2,1,3)  # (B,F,T,C)
-        inter_x = x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3]) 
+        # 调整维度以便进行时间帧间处理
+        x = intra_out.permute(0, 2, 1, 3)  # (B,F,T,C)
+        # 将时间帧和批量合并，以便进行独立处理
+        inter_x = x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3])
+        # 应用 Inter RNN 进行时间帧间处理
         inter_x = self.inter_rnn(inter_x)[0]  # (B*F,T,C)
-        inter_x = self.inter_fc(inter_x)      # (B*F,T,C)
+        # 应用全连接层
+        inter_x = self.inter.fc(inter_x)      # (B*F,T,C)
+        # 恢复时间帧和批量维度
         inter_x = inter_x.reshape(x.shape[0], self.width, -1, self.hidden_size) # (B,F,T,C)
-        inter_x = inter_x.permute(0,2,1,3)   # (B,T,F,C)
-        inter_x = self.inter_ln(inter_x) 
+        # 调整维度以匹配后续操作
+        inter_x = inter_x.permute(0, 2, 1, 3)   # (B,T,F,C)
+        # 应用层归一化
+        inter_x = self.inter_ln(inter_x)
+        # 将 Intra RNN 输出与 Inter RNN 输出相加（残差连接）
         inter_out = torch.add(intra_out, inter_x)
-        
-        dual_out = inter_out.permute(0,3,1,2)  # (B,C,T,F)
-        
+
+        # 调整维度以匹配输入格式
+        dual_out = inter_out.permute(0, 3, 1, 2)  # (B,C,T,F)
+
         return dual_out
+
 
 
 class Encoder(nn.Module):
@@ -277,45 +339,72 @@ class Mask(nn.Module):
 class GTCRN(nn.Module):
     def __init__(self):
         super().__init__()
+        # ERB 模块用于将输入特征转换为耳蜗谱图
         self.erb = ERB(65, 64)
+        # SFE 模块用于提取子带特征
         self.sfe = SFE(3, 1)
 
+        # 编码器模块
         self.encoder = Encoder()
-        
+
+        # DPGRNN 模块，两个重复的模块用于处理编码后的特征
         self.dpgrnn1 = DPGRNN(16, 33, 16)
         self.dpgrnn2 = DPGRNN(16, 33, 16)
-        
+
+        # 解码器模块
         self.decoder = Decoder()
 
+        # 掩码生成模块
         self.mask = Mask()
 
     def forward(self, spec):
         """
-        spec: (B, F, T, 2)
-        """
-        spec_ref = spec  # (B,F,T,2)
+        前向传播函数
 
-        spec_real = spec[..., 0].permute(0,2,1)
-        spec_imag = spec[..., 1].permute(0,2,1)
+        参数:
+            spec (Tensor): 输入频谱，形状为 (B, F, T, 2)，其中 B 是批量大小，
+                           F 是频率点数，T 是时间帧数，2 表示实部和虚部。
+
+        返回:
+            Tensor: 增强后的频谱，形状为 (B, F, T, 2)
+        """
+        spec_ref = spec  # 保存原始频谱用于后续计算
+
+        # 提取实部并调整维度
+        spec_real = spec[..., 0].permute(0, 2, 1)
+        # 提取虚部并调整维度
+        spec_imag = spec[..., 1].permute(0, 2, 1)
+        # 计算频谱幅度
         spec_mag = torch.sqrt(spec_real**2 + spec_imag**2 + 1e-12)
+        # 构建输入特征，包含幅度、实部和虚部
         feat = torch.stack([spec_mag, spec_real, spec_imag], dim=1)  # (B,3,T,257)
 
+        # 应用 ERB 滤波器组进行特征转换
         feat = self.erb.bm(feat)  # (B,3,T,129)
+        # 应用 SFE 模块提取子带特征
         feat = self.sfe(feat)     # (B,9,T,129)
 
+        # 编码器处理特征
         feat, en_outs = self.encoder(feat)
-        
+
+        # 第一个 DPGRNN 模块处理编码后的特征
         feat = self.dpgrnn1(feat) # (B,16,T,33)
+        # 第二个 DPGRNN 模块进一步处理特征
         feat = self.dpgrnn2(feat) # (B,16,T,33)
 
+        # 解码器处理特征，并结合编码器的输出
         m_feat = self.decoder(feat, en_outs)
-        
+
+        # 应用逆 ERB 滤波器组恢复频谱维度
         m = self.erb.bs(m_feat)
 
-        spec_enh = self.mask(m, spec_ref.permute(0,3,2,1)) # (B,2,T,F)
-        spec_enh = spec_enh.permute(0,3,2,1)  # (B,F,T,2)
-        
+        # 应用掩码生成增强后的频谱
+        spec_enh = self.mask(m, spec_ref.permute(0, 3, 2, 1)) # (B,2,T,F)
+        # 调整维度以匹配输入格式
+        spec_enh = spec_enh.permute(0, 3, 2, 1)  # (B,F,T,2)
+
         return spec_enh
+
 
 
 if __name__ == "__main__":
