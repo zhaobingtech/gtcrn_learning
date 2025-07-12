@@ -65,31 +65,85 @@ class SFE(nn.Module):
     """Subband Feature Extraction"""
     def __init__(self, kernel_size=3, stride=1):
         super().__init__()
+        # 保存 kernel size 参数
         self.kernel_size = kernel_size
-        self.unfold = nn.Unfold(kernel_size=(1,kernel_size), stride=(1, stride), padding=(0, (kernel_size-1)//2))
-        
+        # 定义 unfold 操作，用于提取子带特征
+        # 在频率轴（第2维）上进行滑动窗口操作
+        self.unfold = nn.Unfold(kernel_size=(1,kernel_size),
+                               stride=(1, stride),
+                               padding=(0, (kernel_size-1)//2))
+
     def forward(self, x):
-        """x: (B,C,T,F)"""
-        xs = self.unfold(x).reshape(x.shape[0], x.shape[1]*self.kernel_size, x.shape[2], x.shape[3])
+        """
+        前向传播函数
+
+        参数:
+            x (Tensor): 输入张量，形状为 (B,C,T,F)，其中 B 是批量大小，
+                        C 是通道数，T 是时间帧数，F 是频率点数。
+
+        返回:
+            Tensor: 提取子带特征后的输出张量
+        """
+        # 使用 unfold 操作提取局部块并重塑张量
+        xs = self.unfold(x).reshape(x.shape[0],
+                                   x.shape[1]*self.kernel_size,
+                                   x.shape[2],
+                                   x.shape[3])
         return xs
 
 
 class TRA(nn.Module):
-    """Temporal Recurrent Attention"""
+    """Temporal Recurrent Attention
+
+    功能说明
+    TRA (Temporal Recurrent Attention) 模块是一种时序注意力机制，它结合了 GRU 和全连接层来学习输入特征的时间依赖性，
+    并将注意力权重应用到原始输入特征上。
+    组件解释
+    att_gru: GRU 循环神经网络，用于捕捉时间序列的长期依赖关系
+    att_fc: 全连接层，将 GRU 输出的高维特征映射回原始通道数
+    att_act: Sigmoid 激活函数，生成注意力权重，控制各个时间帧的重要性
+    流程解析
+    首先计算输入特征每个时间帧的能量（功率）
+    然后使用 GRU 提取时序特征
+    接着通过全连接层和激活函数生成注意力权重
+    最后将注意力权重应用到原始输入特征上，强调重要时间帧的特征，抑制不重要的特征
+        """
     def __init__(self, channels):
         super().__init__()
+        # 定义 GRU 循环神经网络，用于时序建模
         self.att_gru = nn.GRU(channels, channels*2, 1, batch_first=True)
+        # 全连接层，将 GRU 的输出映射回原始通道数
         self.att_fc = nn.Linear(channels*2, channels)
+        # Sigmoid 激活函数，生成注意力权重
         self.att_act = nn.Sigmoid()
 
     def forward(self, x):
-        """x: (B,C,T,F)"""
-        zt = torch.mean(x.pow(2), dim=-1)  # (B,C,T)
+        """
+        前向传播函数
+
+        参数:
+            x (Tensor): 输入张量，形状为 (B,C,T,F)，其中 B 是批量大小，
+                        C 是通道数，T 是时间帧数，F 是频率点数。
+
+        返回:
+            Tensor: 应用注意力机制后的输出张量，形状与输入相同
+        """
+        # 计算每个时间帧的能量（功率），形状变为 (B,C,T)
+        zt = torch.mean(x.pow(2), dim=-1)
+
+        # 通过 GRU 处理时间序列特征，提取时序依赖关系
         at = self.att_gru(zt.transpose(1,2))[0]
+
+        # 通过全连接层降维，并恢复原始通道数，调整维度顺序回到 (B,C,T)
         at = self.att_fc(at).transpose(1,2)
+
+        # 应用 Sigmoid 激活函数生成注意力权重
         at = self.att_act(at)
+
+        # 添加一个维度扩展注意力权重到 (B,C,T,1)
         At = at[..., None]  # (B,C,T,1)
 
+        # 将注意力权重应用到输入特征上，进行特征增强
         return x * At
 
 
@@ -108,46 +162,70 @@ class GTConvBlock(nn.Module):
     """Group Temporal Convolution"""
     def __init__(self, in_channels, hidden_channels, kernel_size, stride, padding, dilation, use_deconv=False):
         super().__init__()
+        # 是否使用反卷积
         self.use_deconv = use_deconv
+        # 计算需要填充的时间步数
         self.pad_size = (kernel_size[0]-1) * dilation[0]
+        # 根据是否使用反卷积选择相应的卷积模块
         conv_module = nn.ConvTranspose2d if use_deconv else nn.Conv2d
-    
+
+        # 子带特征提取模块
         self.sfe = SFE(kernel_size=3, stride=1)
-        
+
+        # 第一个点卷积层（1x1卷积）
         self.point_conv1 = conv_module(in_channels//2*3, hidden_channels, 1)
+        # 批归一化层
         self.point_bn1 = nn.BatchNorm2d(hidden_channels)
+        # 激活函数
         self.point_act = nn.PReLU()
 
+        # 深度可分离卷积层
         self.depth_conv = conv_module(hidden_channels, hidden_channels, kernel_size,
                                             stride=stride, padding=padding,
                                             dilation=dilation, groups=hidden_channels)
+        # 批归一化层
         self.depth_bn = nn.BatchNorm2d(hidden_channels)
+        # 激活函数
         self.depth_act = nn.PReLU()
 
+        # 第二个点卷积层（1x1卷积）
         self.point_conv2 = conv_module(hidden_channels, in_channels//2, 1)
+        # 批归一化层
         self.point_bn2 = nn.BatchNorm2d(in_channels//2)
-        
+
+        # 时序循环注意力模块
         self.tra = TRA(in_channels//2)
 
     def shuffle(self, x1, x2):
         """x1, x2: (B,C,T,F)"""
+        # 将两个张量堆叠在一起
         x = torch.stack([x1, x2], dim=1)
+        # 调整维度顺序并保持内存连续
         x = x.transpose(1, 2).contiguous()  # (B,C,2,T,F)
+        # 重新排列张量形状
         x = rearrange(x, 'b c g t f -> b (c g) t f')  # (B,2C,T,F)
         return x
 
     def forward(self, x):
         """x: (B, C, T, F)"""
+        # 将输入张量分为两部分
         x1, x2 = torch.chunk(x, chunks=2, dim=1)
 
+        # 应用子带特征提取
         x1 = self.sfe(x1)
+        # 第一个点卷积操作
         h1 = self.point_act(self.point_bn1(self.point_conv1(x1)))
+        # 对时间轴进行填充
         h1 = nn.functional.pad(h1, [0, 0, self.pad_size, 0])
+        # 深度可分离卷积操作
         h1 = self.depth_act(self.depth_bn(self.depth_conv(h1)))
+        # 第二个点卷积操作
         h1 = self.point_bn2(self.point_conv2(h1))
 
+        # 应用时序循环注意力
         h1 = self.tra(h1)
 
+        # 对处理后的特征和原始的第二部分进行混洗操作
         x =  self.shuffle(h1, x2)
         
         return x
@@ -290,15 +368,37 @@ class DPGRNN(nn.Module):
 class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
+        # 编码器由多个卷积块组成，逐步提取并压缩特征
         self.en_convs = nn.ModuleList([
+            # 第一个卷积块：输入通道为 3*3（经过 SFE 处理后的特征），输出通道为 16
+            # 使用 (1,5) 的 kernel 进行频率轴上的下采样，padding 保持时间维度不变
             ConvBlock(3*3, 16, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
+
+            # 第二个卷积块：输入输出通道均为 16，使用分组卷积（groups=2）减少计算量
             ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=False, is_last=False),
+
+            # 第三个卷积块：使用 GTConvBlock 提取时频特征，不进行下采样
             GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1), use_deconv=False),
+
+            # 第四个卷积块：空洞卷积，扩大感受野，提升上下文建模能力
             GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1), use_deconv=False),
+
+            # 第五个卷积块：进一步扩大空洞因子，增强长时依赖建模
             GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1), use_deconv=False)
         ])
 
     def forward(self, x):
+        """
+        前向传播函数
+        #
+        参数:
+            x (Tensor): 输入张量，形状为 (B, C, T, F)，其中 B 是批量大小，
+                        C 是通道数，T 是时间帧数，F 是频率点数。
+
+        返回:
+            Tensor: 编码器最后一层的输出特征
+            List[Tensor]: 各层输出特征组成的列表，用于解码器中的跳跃连接
+        """
         en_outs = []
         for i in range(len(self.en_convs)):
             x = self.en_convs[i](x)
@@ -330,8 +430,22 @@ class Mask(nn.Module):
         super().__init__()
 
     def forward(self, mask, spec):
+        """
+        应用复数比值掩码来增强频谱。
+
+        参数:
+            mask (Tensor): 掩码张量，形状为 (B, 2, T, F)，其中 B 是批量大小，
+                           T 是时间帧数，F 是频率点数。
+            spec (Tensor): 原始频谱张量，形状为 (B, 2, T, F)
+
+        返回:
+            Tensor: 增强后的频谱张量，形状为 (B, 2, T, F)
+        """
+        # 计算增强后的实部
         s_real = spec[:,0] * mask[:,0] - spec[:,1] * mask[:,1]
+        # 计算增强后的虚部
         s_imag = spec[:,1] * mask[:,0] + spec[:,0] * mask[:,1]
+        # 将实部和虚部堆叠在一起，形成复数频谱
         s = torch.stack([s_real, s_imag], dim=1)  # (B,2,T,F)
         return s
 
