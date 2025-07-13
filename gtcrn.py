@@ -9,6 +9,12 @@ from einops import rearrange
 
 
 class ERB(nn.Module):
+    """
+    常规应用
+    self.erb = ERB(65, 64)
+    erb_subband_1 = 65
+    erb_subband_2 = 64
+    """
     def __init__(self, erb_subband_1, erb_subband_2, nfft=512, high_lim=8000, fs=16000):
         super().__init__()
         erb_filters = self.erb_filter_banks(erb_subband_1, erb_subband_2, nfft, high_lim, fs)
@@ -48,18 +54,41 @@ class ERB(nn.Module):
         erb_filters = erb_filters[:, erb_subband_1:]
         return torch.from_numpy(np.abs(erb_filters))
     
-    def bm(self, x):
-        """x: (B,C,T,F)"""
-        x_low = x[..., :self.erb_subband_1]
-        x_high = self.erb_fc(x[..., self.erb_subband_1:])
-        return torch.cat([x_low, x_high], dim=-1)
-    
     def bs(self, x_erb):
-        """x: (B,C,T,F_erb)"""
-        x_erb_low = x_erb[..., :self.erb_subband_1]
-        x_erb_high = self.ierb_fc(x_erb[..., self.erb_subband_1:])
-        return torch.cat([x_erb_low, x_erb_high], dim=-1)
+        """
+        输入张量 x_erb 的形状为 (B, C, T, F_erb)，表示批量大小、通道数、时间帧数、耳蜗子带数。
 
+        该函数作用是将耳蜗谱图还原回原始频谱维度，通过线性插值补全高频部分，
+        并保持低频部分不变，最后拼接成完整的频谱结构。
+        """
+        # 提取耳蜗谱图中的低频部分，这部分对应原始频谱的低频，无需变化，直接保留
+        x_erb_low = x_erb[..., :self.erb_subband_1]  # shape: (B, C, T, erb_subband_1) erb_subband_1 = 65
+
+        # 对耳蜗谱图中的高频部分进行逆变换，恢复原始频谱的高频信息
+        # 输入为 x_high_erb = x_erb[..., self.erb_subband_1:]，shape: (B, C, T, erb_subband_2)
+        # 经过 self.ierb_fc 投影后得到 shape: (B, C, T, F - erb_subband_1)
+        x_erb_high = self.ierb_fc(x_erb[..., self.erb_subband_1:])  # 逆线性投影，恢复高频部分   erb_subband_1 = 65
+
+        # 将恢复的低频和高频部分在最后一个维度上拼接起来，得到完整频谱
+        return torch.cat([x_erb_low, x_erb_high], dim=-1)  # shape: (B, C, T, F)
+
+    def bm(self, x):
+        """
+        输入张量 x 的形状为 (B, C, T, F)，表示批量大小、通道数、时间帧数、频率点数。
+
+        该函数作用是将高频分辨率的原始频谱部分通过线性变换压缩到耳蜗子带（Cochleagram），
+        同时保留低频部分不变，最后拼接输出耳蜗谱图特征。
+        """
+        # 提取低频部分：前 self.erb_subband_1 个频率点不进行变换，直接保留
+        x_low = x[..., :self.erb_subband_1]  # shape: (B, C, T, erb_subband_1)
+
+        # 对剩余的高频部分应用线性变换，使用预定义的 ERB 滤波器矩阵进行投影
+        # 输入为 x_high_part = x[..., self.erb_subband_1:]，shape: (B, C, T, F - erb_subband_1)
+        # 经过 self.erb_fc 投影后得到 shape: (B, C, T, erb_subband_2)
+        x_high = self.erb_fc(x[..., self.erb_subband_1:])  # 线性投影，shape 变化
+
+        # 将低频与高频部分在最后一个维度上拼接起来，形成最终的耳蜗谱图特征
+        return torch.cat([x_low, x_high], dim=-1)  # shape: (B, C, T, erb_subband_1 + erb_subband_2)
 
 class SFE(nn.Module):
     """Subband Feature Extraction"""
@@ -148,13 +177,52 @@ class TRA(nn.Module):
 
 
 class ConvBlock(nn.Module):
+    """
+    卷积块模块，包含卷积层、批归一化层和激活函数。
+
+    参数:
+        in_channels (int): 输入通道数
+        out_channels (int): 输出通道数
+        kernel_size (tuple or int): 卷积核大小
+        stride (tuple or int): 步长
+        padding (tuple or int): 填充大小
+        groups (int): 分组卷积的组数，默认为1（即普通卷积）
+        use_deconv (bool): 是否使用反卷积，默认为False
+        is_last (bool): 是否是最后一层卷积块，默认为False（影响激活函数的选择）
+
+
+    功能说明：
+    卷积操作：根据 use_deconv 的值选择使用普通卷积 (nn.Conv2d) 或者反卷积 (nn.ConvTranspose2d)。
+    批归一化：对卷积输出进行标准化处理，加速训练并提高模型稳定性。
+    激活函数：如果当前卷积块是最后一层 (is_last=True)，则使用 Tanh 激活函数；否则使用 PReLU 激活函数。
+    使用场景：
+    该模块通常用于构建编码器或解码器中的卷积块，支持普通卷积、分组卷积和反卷积操作，具有良好的灵活性。
+
+    """
+
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding, groups=1, use_deconv=False, is_last=False):
         super().__init__()
+        # 根据是否使用反卷积选择相应的卷积模块
         conv_module = nn.ConvTranspose2d if use_deconv else nn.Conv2d
+
+        # 初始化卷积层
         self.conv = conv_module(in_channels, out_channels, kernel_size, stride, padding, groups=groups)
+        # 初始化批归一化层
         self.bn = nn.BatchNorm2d(out_channels)
+        # 如果是最后一层，则使用 Tanh 激活函数；否则使用 PReLU 激活函数
         self.act = nn.Tanh() if is_last else nn.PReLU()
+
     def forward(self, x):
+        """
+        前向传播函数
+
+        参数:
+            x (Tensor): 输入张量，形状为 (B,C,T,F)，其中 B 是批量大小，
+                        C 是通道数，T 是时间帧数，F 是频率点数。
+
+        返回:
+            Tensor: 经过卷积、批归一化和激活函数后的输出张量
+        """
         return self.act(self.bn(self.conv(x)))
 
 
@@ -366,6 +434,35 @@ class DPGRNN(nn.Module):
 
 
 class Encoder(nn.Module):
+    """
+       编码器模块，用于逐步提取并压缩输入特征，构建多尺度特征表示。
+
+       结构说明：
+           编码器由 5 个卷积块组成，包含普通卷积、分组卷积、深度可分离卷积以及空洞卷积，
+           通过逐步下采样和扩大感受野，实现对时频域特征的高效建模。
+
+           - 使用频率轴方向的卷积进行降维（下采样）
+           - 引入 GTConvBlock 增强局部上下文信息
+           - 空洞卷积扩大模型对长时依赖的感知能力
+
+       模块构成：
+           1. ConvBlock: 频率轴下采样卷积，提升通道数至 16
+           2. ConvBlock: 分组卷积，进一步下采样，减少计算量
+           3. GTConvBlock: 本地时频建模，不改变分辨率
+           4. GTConvBlock: 扩大感受野，增强上下文建模
+           5. GTConvBlock: 更大空洞因子，捕获更长时序依赖
+
+       前向传播输出：
+           返回编码器最后一层的特征张量以及各层输出组成的列表，
+           后者用于解码器中的跳跃连接（skip connections），保留多尺度细节信息。
+
+       输入形状：
+           (B, C, T, F)：批量大小、通道数、时间帧数、频率点数
+
+       输出形状：
+           Tensor: 最后一层输出特征 (B, C', T', F')
+           List[Tensor]: 各层输出特征组成的列表，用于跳跃连接
+       """
     def __init__(self):
         super().__init__()
         # 编码器由多个卷积块组成，逐步提取并压缩特征
@@ -407,21 +504,60 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
+    """
+    解码器模块，用于从编码器提取的特征中重建目标频谱。
+
+    解码器由多个上采样卷积块组成，结合编码器的跳跃连接（skip connections），
+    逐步恢复时间-频率分辨率，最终输出增强后的频谱掩码。
+
+    功能说明：
+    解码器结构：使用 GTConvBlock 和 ConvBlock 构建，逐步恢复时间-频率分辨率。
+    跳跃连接：通过将解码器的输入与编码器对应层的输出相加，保留细节信息并提升重建质量。
+    空洞卷积与反卷积：
+    使用不同空洞因子的 GTConvBlock 来扩大感受野，捕获长时依赖。
+    使用 use_deconv=True 的 ConvBlock 进行频率轴上的上采样。
+    使用场景：
+    在语音增强任务中，该解码器用于从编码器提取的低分辨率特征中重建高分辨率的复数频谱掩码。
+    """
+
     def __init__(self):
         super().__init__()
+        # 解码器由多个 GTConvBlock 和 ConvBlock 组成
         self.de_convs = nn.ModuleList([
+            # 第一个 GTConvBlock：空洞因子为5的时域空洞卷积，进行特征扩展
             GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2*5,1), dilation=(5,1), use_deconv=True),
+
+            # 第二个 GTConvBlock：空洞因子为2的时域空洞卷积
             GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
+
+            # 第三个 GTConvBlock：普通卷积，无额外空洞
             GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2*1,1), dilation=(1,1), use_deconv=True),
+
+            # 第四个 ConvBlock：分组反卷积，用于频率轴上采样
             ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
+
+            # 第五个 ConvBlock：输出层，将通道数映射到2（实部和虚部）
             ConvBlock(16, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
         ])
 
     def forward(self, x, en_outs):
+        """
+        前向传播函数
+
+        参数:
+            x (Tensor): 编码器输出的特征张量，形状为 (B, C, T, F)，其中 B 是批量大小，
+                        C 是通道数，T 是时间帧数，F 是频率点数。
+            en_outs (List[Tensor]): 编码器各层输出的特征列表，用于跳跃连接
+
+        返回:
+            Tensor: 解码器输出的增强频谱掩码
+        """
         N_layers = len(self.de_convs)
         for i in range(N_layers):
-            x = self.de_convs[i](x + en_outs[N_layers-1-i])
+            # 将当前解码器层的输入与对应编码器层的输出相加（跳跃连接）
+            x = self.de_convs[i](x + en_outs[N_layers - 1 - i])
         return x
+
     
 
 class Mask(nn.Module):
